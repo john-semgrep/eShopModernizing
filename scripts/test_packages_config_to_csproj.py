@@ -26,6 +26,7 @@ from packages_config_to_csproj import (
     build_csproj,
     convert,
     scan_directory,
+    SYNTHETIC_SUBDIR,
     SYNTHETIC_FILENAME,
 )
 
@@ -92,7 +93,7 @@ class TestParsePackagesConfig:
         assert packages[0]["targetFramework"] == ""
         cfg.unlink()
 
-    def test_skips_package_with_no_version(self, capsys=None):
+    def test_skips_package_with_no_version(self):
         cfg = write_temp_config("""
             <packages>
               <package id="BadPackage" />
@@ -100,7 +101,6 @@ class TestParsePackagesConfig:
             </packages>
         """)
         packages = parse_packages_config(cfg)
-        # BadPackage should be skipped
         assert len(packages) == 1
         assert packages[0]["id"] == "GoodPackage"
         cfg.unlink()
@@ -177,7 +177,6 @@ class TestResolveTargetFramework:
             {"targetFramework": "net48"},
             {"targetFramework": "net46"},
         ]
-        # Reverse sort: net48 > net46 > net45
         result = resolve_target_framework(packages)
         assert result == "net48"
 
@@ -269,7 +268,7 @@ class TestConvert:
     def test_write_to_file(self):
         cfg = self._basic_config()
         with tempfile.TemporaryDirectory() as tmpdir:
-            out = Path(tmpdir) / "_semgrep_synthetic.csproj"
+            out = Path(tmpdir) / "project.csproj"
             convert(cfg, output_path=out)
             assert out.exists()
             content = out.read_text()
@@ -279,7 +278,7 @@ class TestConvert:
     def test_dry_run_does_not_write(self):
         cfg = self._basic_config()
         with tempfile.TemporaryDirectory() as tmpdir:
-            out = Path(tmpdir) / "_semgrep_synthetic.csproj"
+            out = Path(tmpdir) / "project.csproj"
             convert(cfg, output_path=out, dry_run=True)
             assert not out.exists()
         cfg.unlink()
@@ -293,20 +292,24 @@ class TestConvert:
     def test_creates_parent_dirs(self):
         cfg = self._basic_config()
         with tempfile.TemporaryDirectory() as tmpdir:
-            out = Path(tmpdir) / "deep" / "nested" / "dir" / "_semgrep_synthetic.csproj"
+            out = Path(tmpdir) / "_semgrep_sc" / "project.csproj"
             convert(cfg, output_path=out)
             assert out.exists()
         cfg.unlink()
 
 
 # ---------------------------------------------------------------------------
-# Test: scan_directory
+# Test: scan_directory — KEY TESTS for the MSB1050 fix
 # ---------------------------------------------------------------------------
 
 class TestScanDirectory:
 
     def _make_repo(self, base: Path):
-        """Create a fake repo tree with multiple packages.config files."""
+        """
+        Create a fake repo tree that mirrors the real-world collision scenario:
+        each project folder has BOTH a packages.config AND an existing .csproj.
+        This is the exact setup that triggered MSB1050.
+        """
         projects = {
             "ProjectA/packages.config": """
                 <packages>
@@ -325,7 +328,14 @@ class TestScanDirectory:
                 </packages>
             """,
         }
-        for rel_path, content in projects.items():
+        # Also create pre-existing .csproj files in the same folders
+        # to simulate the real collision scenario
+        existing_csprojs = {
+            "ProjectA/ProjectA.csproj": "<Project></Project>",
+            "ProjectB/ProjectB.csproj": "<Project></Project>",
+            "ProjectC/nested/ProjectC.csproj": "<Project></Project>",
+        }
+        for rel_path, content in {**projects, **existing_csprojs}.items():
             full = base / rel_path
             full.parent.mkdir(parents=True, exist_ok=True)
             full.write_text(textwrap.dedent(content))
@@ -337,24 +347,69 @@ class TestScanDirectory:
             self._make_repo(base)
             count = scan_directory(base)
             assert count == 3
-            assert (base / "ProjectA" / SYNTHETIC_FILENAME).exists()
-            assert (base / "ProjectB" / SYNTHETIC_FILENAME).exists()
-            assert (base / "ProjectC" / "nested" / SYNTHETIC_FILENAME).exists()
+
+    def test_synthetic_in_own_subdirectory(self):
+        """
+        Core MSB1050 fix: synthetic .csproj must be in _semgrep_sc/ subdir,
+        NOT sitting next to the existing .csproj in the same folder.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            self._make_repo(base)
+            scan_directory(base)
+
+            # Synthetic files should be in _semgrep_sc/ subdirs
+            assert (base / "ProjectA" / SYNTHETIC_SUBDIR / SYNTHETIC_FILENAME).exists()
+            assert (base / "ProjectB" / SYNTHETIC_SUBDIR / SYNTHETIC_FILENAME).exists()
+            assert (base / "ProjectC" / "nested" / SYNTHETIC_SUBDIR / SYNTHETIC_FILENAME).exists()
+
+    def test_no_collision_with_existing_csproj(self):
+        """
+        The synthetic file must NOT land in the same folder as the existing .csproj.
+        If it did, dotnet restore would hit MSB1050.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            self._make_repo(base)
+            scan_directory(base)
+
+            # Confirm the original .csproj folders do NOT contain the synthetic file
+            assert not (base / "ProjectA" / SYNTHETIC_FILENAME).exists()
+            assert not (base / "ProjectB" / SYNTHETIC_FILENAME).exists()
+
+            # Confirm original .csproj files are untouched
+            assert (base / "ProjectA" / "ProjectA.csproj").exists()
+            assert (base / "ProjectB" / "ProjectB.csproj").exists()
+
+    def test_each_synthetic_subdir_has_only_one_csproj(self):
+        """
+        dotnet restore needs exactly one .csproj per folder.
+        Verify _semgrep_sc/ contains only project.csproj and nothing else.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            self._make_repo(base)
+            scan_directory(base)
+
+            sc_dir = base / "ProjectA" / SYNTHETIC_SUBDIR
+            csproj_files = list(sc_dir.glob("*.csproj"))
+            assert len(csproj_files) == 1
+            assert csproj_files[0].name == SYNTHETIC_FILENAME
 
     def test_dry_run_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             self._make_repo(base)
             scan_directory(base, dry_run=True)
-            assert not (base / "ProjectA" / SYNTHETIC_FILENAME).exists()
-            assert not (base / "ProjectB" / SYNTHETIC_FILENAME).exists()
+            assert not (base / "ProjectA" / SYNTHETIC_SUBDIR).exists()
+            assert not (base / "ProjectB" / SYNTHETIC_SUBDIR).exists()
 
     def test_synthetic_csproj_is_valid_xml(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             self._make_repo(base)
             scan_directory(base)
-            csproj = base / "ProjectA" / SYNTHETIC_FILENAME
+            csproj = base / "ProjectA" / SYNTHETIC_SUBDIR / SYNTHETIC_FILENAME
             root = ET.parse(csproj).getroot()
             refs = root.findall(".//PackageReference")
             assert len(refs) == 1

@@ -6,12 +6,16 @@ Converts one or more packages.config files into synthetic .csproj files
 with <PackageReference> entries that Semgrep Supply Chain can consume
 via `semgrep ci --allow-local-builds`.
 
+Each synthetic .csproj is placed in its own subdirectory (_semgrep_sc/)
+next to the packages.config. This avoids the MSB1050 error that occurs
+when dotnet restore finds multiple .csproj files in the same folder.
+
 Usage:
     # Single file, output to stdout
     python packages_config_to_csproj.py packages.config
 
     # Single file, write to specific path
-    python packages_config_to_csproj.py packages.config -o MyProject/_semgrep_synthetic.csproj
+    python packages_config_to_csproj.py packages.config -o MyProject/_semgrep_sc/project.csproj
 
     # Walk an entire repo and convert every packages.config found
     python packages_config_to_csproj.py --scan-dir ./src
@@ -168,12 +172,19 @@ def convert(input_path: Path, output_path: Path | None = None, dry_run: bool = F
 # Directory scan mode
 # ---------------------------------------------------------------------------
 
-SYNTHETIC_FILENAME = "_semgrep_synthetic.csproj"
+# Synthetic files go in their own subdirectory to avoid MSB1050:
+# "folder contains more than one project or solution file"
+# This happens when the synthetic .csproj lands next to an existing .csproj
+# and dotnet restore can't determine which one to use.
+SYNTHETIC_SUBDIR = "_semgrep_sc"
+SYNTHETIC_FILENAME = "project.csproj"
 
 
 def scan_directory(root_dir: Path, dry_run: bool = False) -> int:
     """
     Recursively find all packages.config files under root_dir and convert each one.
+    Each synthetic .csproj is written to a _semgrep_sc/ subdirectory alongside
+    the packages.config, keeping it isolated from any existing .csproj files.
     Returns the count of files processed.
     """
     found = list(root_dir.rglob("packages.config"))
@@ -185,7 +196,9 @@ def scan_directory(root_dir: Path, dry_run: bool = False) -> int:
     print(f"Found {len(found)} packages.config file(s):\n")
     count = 0
     for cfg_path in found:
-        output_path = cfg_path.parent / SYNTHETIC_FILENAME
+        # Place the synthetic .csproj in its own subdirectory so dotnet restore
+        # sees exactly one project file when pointed at that folder.
+        output_path = cfg_path.parent / SYNTHETIC_SUBDIR / SYNTHETIC_FILENAME
         try:
             result = convert(cfg_path, output_path, dry_run=dry_run)
             if result is not None:
