@@ -45,6 +45,6 @@ jobs:
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
 
-      - name: Clean up synthetic .csproj files
+      - name: Clean up synthetic files
         if: always()
-        run: find . -name "_semgrep_synthetic.csproj" -delete
+        run: find . -type d -name "_semgrep_sc" -exec rm -rf {} +
